@@ -1,17 +1,17 @@
 # Docker commands (this project)
 
-Run all `docker compose` commands from the **repository root** (where `docker-compose.yaml` lives). Compose reads `.env` in that directory for variables such as `API_PUBLISH_PORT`, `POSTGRES_PUBLISH_PORT`, `REDIS_PUBLISH_PORT`, `POSTGRES_DB`, and JWT/Google settings required by the API container.
+Run all `docker compose` commands from the **repository root** (where `docker-compose.yaml` lives). Compose reads `.env` in that directory for variables such as `API_PUBLISH_PORT`, `POSTGRES_PUBLISH_PORT`, `POSTGRES_DB`, and JWT/Google settings required by the API container.
 
 ## Everyday workflow
 
 | Goal | Command |
 |------|---------|
-| Start API, Postgres, and Redis (detached) | `docker compose up -d` |
+| Start API, Postgres| `docker compose up -d` |
 | Start and rebuild images after Dockerfile or dependency changes | `docker compose up -d --build` |
 | Stop containers (keep volumes) | `docker compose down` |
-| Stop containers **and delete** named volumes (Postgres + Redis data) | `docker compose down -v` |
+| Stop containers **and delete** named volumes (Postgres data) | `docker compose down -v` |
 | Follow logs (all services) | `docker compose logs -f` |
-| Logs for one service | `docker compose logs -f api` (or `database`, `redis`) |
+| Logs for one service | `docker compose logs -f api` (or `database`) |
 
 After `up`, the API is available at `http://localhost:${API_PUBLISH_PORT}` (see `.env`). Default in many setups is port `8000` or whatever you set in `API_PUBLISH_PORT`.
 
@@ -19,10 +19,10 @@ After `up`, the API is available at `http://localhost:${API_PUBLISH_PORT}` (see 
 
 | Goal | Command |
 |------|---------|
-| Postgres + Redis only (no API container) | `docker compose up -d database redis` |
-| Useful for local `uvicorn` with host `DATABASE_URL` / `REDIS_URL` pointing at published ports | Same as above, then run the app on the host |
+| Postgres only (no API container) | `docker compose up -d database` |
+| Useful for local `uvicorn` with host `DATABASE_URL` pointing at published ports | Same as above, then run the app on the host |
 
-Service names in this file: `database`, `redis`, `api`. The `migrate` service is profile-gated (see below).
+Service names in this file: `database`, `api`. The `migrate` service is profile-gated (see below).
 
 ## Database migrations (Alembic)
 
@@ -48,7 +48,7 @@ Runs `python -m alembic upgrade head` with the same environment as the API (incl
 docker compose exec database psql -U postgres -d mydb
 ```
 
-Container names (fixed in compose): `backend-postgres-database`, `backend-fastapi-postgresql-redis`, `backend-fastapi-postgresql-api`.
+Container names (fixed in compose): `backend-postgres-database`, `backend-fastapi-postgresql-api`.
 
 ## Images and cache
 
@@ -59,10 +59,10 @@ Container names (fixed in compose): `backend-postgres-database`, `backend-fastap
 
 ## Volumes
 
-Named volumes in this project: `fastapi_postgresql_pgdata`, `fastapi_postgresql_redisdata`.
+Named volumes in this project: `fastapi_postgresql_pgdata`
 
 - **Remove volumes** (destructive): `docker compose down -v`
-- **When to do it:** You changed `POSTGRES_DB` and Postgres still has the old database only; you want a clean DB/Redis state for development.
+- **When to do it:** You changed `POSTGRES_DB` and Postgres still has the old database only; 
 
 Postgres creates the database in `POSTGRES_DB` only on **first initialization** of an empty data directory. If you change `POSTGRES_DB` in `.env` but keep the old volume, either run `down -v` and `up` again or create the new database manually inside Postgres.
 
@@ -74,7 +74,6 @@ Postgres creates the database in `POSTGRES_DB` only on **first initialization** 
 ## Troubleshooting quick checks
 
 1. **API exits on startup (DB errors):** `docker compose logs api` — confirm Postgres is healthy and `POSTGRES_DB` matches an existing database in the volume.
-2. **Port already in use:** Change `API_PUBLISH_PORT`, `POSTGRES_PUBLISH_PORT`, or `REDIS_PUBLISH_PORT` in `.env` and `docker compose up -d` again.
+2. **Port already in use:** Change `API_PUBLISH_PORT`, `POSTGRES_PUBLISH_PORT`, in `.env` and `docker compose up -d` again.
 3. **Stale code in container:** `docker compose up -d --build api`
-
-For deeper Postgres and Redis setup, see `markdown/4. POSTGRES_DOCKER_GUIDE.md` and `markdown/5. REDIS_DOCKER_GUIDE.md`.
+.

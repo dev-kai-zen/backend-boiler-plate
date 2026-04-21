@@ -2,7 +2,6 @@ import secrets
 from datetime import timedelta
 from typing import Any, Callable, cast
 
-import redis
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import text
 from sqlalchemy.orm import Session

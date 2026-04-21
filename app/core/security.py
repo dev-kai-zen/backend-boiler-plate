@@ -1,19 +1,29 @@
+from __future__ import annotations
+
 from datetime import UTC, datetime, timedelta
+import time
+from threading import Lock
+import uuid
 from typing import Any
 
+import bcrypt
+import jwt
 from fastapi import HTTPException, status
 
 from app.core.config import Settings, get_settings
 
-from contextlib import contextmanager
-from collections.abc import Generator
-import uuid
+# bcrypt truncates secrets longer than 72 bytes; keep passwords within normal UX limits.
+_MAX_PASSWORD_BYTES = 72
 
-import redis
+_revoke_lock = Lock()
+# refresh token `jti` -> JWT `exp` (unix); entry removed once exp passed
+_revoked_refresh_jtis: dict[str, int] = {}
 
-import bcrypt
 
-import jwt
+def _prune_revoked_unlocked(now: int) -> None:
+    stale = [jti for jti, exp in _revoked_refresh_jtis.items() if now >= exp]
+    for jti in stale:
+        del _revoked_refresh_jtis[jti]
 
 
 def create_access_token(
@@ -28,6 +38,7 @@ def create_access_token(
     if expires_delta is None:
         expires_delta = timedelta(minutes=settings.access_token_expire_minutes)
     expire = now + expires_delta
+    # Modify the payload
     payload: dict[str, Any] = {
         "user": user,
         "permissions": permissions,
@@ -46,12 +57,9 @@ def decode_access_token(token: str) -> dict[str, Any]:
     settings: Settings = get_settings()
     secret_key: str = settings.jwt_secret_key
     algorithm: str = settings.jwt_algorithm
-    
-    return jwt.decode(token, secret_key, algorithms=[algorithm]) # type: ignore
 
-
-# bcrypt truncates secrets longer than 72 bytes; keep passwords within normal UX limits.
-_MAX_PASSWORD_BYTES = 72
+    # type: ignore
+    return jwt.decode(token, secret_key, algorithms=[algorithm])
 
 
 def hash_password(plain_password: str) -> str:
@@ -75,24 +83,13 @@ def verify_password(plain_password: str, password_hash: str) -> bool:
         return False
 
 
-_REFRESH_REVOKE_PREFIX = "auth:refresh:revoked:"
-
-
-@contextmanager
-def _redis_client() -> Generator[redis.Redis, None, None]:
-    client = redis.from_url(get_settings().redis_url, decode_responses=True)
-    try:
-        yield client
-    finally:
-        client.close()
-
-
 def _decode_refresh_payload(token: str) -> dict[str, Any]:
     """Verify signature and expiry; ensure claims mark this as a refresh token."""
     settings: Settings = get_settings()
     secret_key: str = settings.jwt_secret_key
     algorithm: str = settings.jwt_algorithm
-    payload = jwt.decode(token, secret_key, algorithms=[algorithm])  # type: ignore
+    payload = jwt.decode(token, secret_key, algorithms=[
+                         algorithm])  # type: ignore
     if payload.get("token_use") != "refresh":
         raise jwt.InvalidTokenError("Not a refresh token")
     jti = payload.get("jti")
@@ -132,11 +129,14 @@ def create_refresh_token(
 
 
 def verify_refresh_token(token: str) -> dict[str, Any]:
-    """Decode a refresh token and ensure it has not been revoked (Redis)."""
+    """Decode a refresh token and ensure it has not been revoked (in-process store)."""
     payload = _decode_refresh_payload(token)
     jti = str(payload["jti"])
-    with _redis_client() as r:
-        if r.get(f"{_REFRESH_REVOKE_PREFIX}{jti}"):
+    now = int(time.time())
+    with _revoke_lock:
+        _prune_revoked_unlocked(now)
+        exp_stored = _revoked_refresh_jtis.get(jti)
+        if exp_stored is not None and now < exp_stored:
             raise jwt.InvalidTokenError("Refresh token has been revoked")
     return payload
 
@@ -174,16 +174,18 @@ def refresh_access_token(refresh_token: str) -> str:
     return create_access_token(user, permissions=permissions)
 
 
+# Need to update because redis is not used
 def revoke_refresh_token(token: str) -> None:
-    """Store `jti` in Redis until token expiry so `verify_refresh_token` rejects it. Idempotent."""
+    """Remember `jti` until token `exp` so `verify_refresh_token` rejects it. Idempotent."""
     payload = _decode_refresh_payload(token)
     jti = str(payload["jti"])
     exp = payload.get("exp")
     if exp is None:
         return
     exp_ts = int(exp)
-    remaining = exp_ts - int(datetime.now(UTC).timestamp())
-    if remaining <= 0:
+    now = int(datetime.now(UTC).timestamp())
+    if exp_ts <= now:
         return
-    with _redis_client() as r:
-        r.setex(f"{_REFRESH_REVOKE_PREFIX}{jti}", remaining, "1")
+    with _revoke_lock:
+        _prune_revoked_unlocked(now)
+        _revoked_refresh_jtis[jti] = exp_ts

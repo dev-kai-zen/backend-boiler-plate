@@ -1,17 +1,20 @@
-"""Per-IP fixed-window rate limits (Redis). Stricter bucket for auth routes."""
+"""Per-IP fixed-window rate limits (in-process). Stricter bucket for auth routes."""
 
 from __future__ import annotations
 
-import asyncio
-import time
 from collections.abc import Awaitable, Callable
+from threading import Lock
+import time
 
-import redis
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from app.core.config import Settings
+
+_lock = Lock()
+# logical key (e.g. "auth:127.0.0.1") -> (window_id, count in that window)
+_windows: dict[str, tuple[int, int]] = {}
 
 
 def client_ip(request: Request) -> str:
@@ -24,8 +27,7 @@ def client_ip(request: Request) -> str:
 
 
 def _enforce_fixed_window(
-    redis_url: str,
-    key: str,
+    logical_key: str,
     limit: int,
     window_seconds: int,
 ) -> tuple[bool, int]:
@@ -34,13 +36,14 @@ def _enforce_fixed_window(
         return True, 0
     now = int(time.time())
     window_id = now // window_seconds
-    redis_key = f"rl:{key}:{window_id}"
-    with redis.from_url(redis_url, decode_responses=True) as r:
-        pipe = r.pipeline()
-        pipe.incr(redis_key)
-        pipe.expire(redis_key, window_seconds)
-        count_s, _ = pipe.execute()
-        count = int(count_s)
+    with _lock:
+        prev = _windows.get(logical_key)
+        if prev is None or prev[0] != window_id:
+            _windows[logical_key] = (window_id, 1)
+            return True, 0
+        _wid, count = prev
+        count += 1
+        _windows[logical_key] = (_wid, count)
         if count > limit:
             retry_after = window_seconds - (now % window_seconds)
             if retry_after <= 0:
@@ -80,12 +83,10 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             bucket = "api"
 
         ip = client_ip(request)
-        key = f"{bucket}:{ip}"
+        logical_key = f"{bucket}:{ip}"
 
-        allowed, retry_after = await asyncio.to_thread(
-            _enforce_fixed_window,
-            s.redis_url,
-            key,
+        allowed, retry_after = _enforce_fixed_window(
+            logical_key,
             limit,
             s.rate_limit_window_seconds,
         )
