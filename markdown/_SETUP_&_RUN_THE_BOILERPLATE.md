@@ -1,0 +1,102 @@
+# Setup and run the boilerplate
+
+Short path from zero to a running API. Use this after you have cloned the repository.
+
+## Prerequisites
+
+- **Python 3.11+** (3.12 is fine). Check with `python3 --version`.
+- **Docker Desktop** (or Docker Engine + Compose v2) if you want Postgres (and the full stack) in containers.
+
+---
+
+## 1. Create your environment file
+
+The repo ships a template named **`.env copy`** (note the space in the filename).
+
+From the project root, copy it to **`.env`** and edit values as needed:
+
+```bash
+cp ".env copy" .env
+```
+
+- **`.env` is gitignored** — do not commit it.
+- For **local** development, keep `DATABASE_URL` pointing at `localhost` and the same host/port as `POSTGRES_PUBLISH_PORT` in `.env` (defaults use port `5435`).
+- Replace OAuth and other secrets with your own values before sharing screenshots or pushing branches.
+
+---
+
+## 2. Python virtual environment
+
+```bash
+python3 -m venv .venv
+```
+
+Activate it:
+
+- **Linux / macOS:**
+
+  ```bash
+  . .venv/bin/activate
+  ```
+
+- **Windows (cmd):**
+
+  ```cmd
+  .venv\Scripts\activate.bat
+  ```
+
+- **Windows (PowerShell):**
+
+  ```powershell
+  .venv\Scripts\Activate.ps1
+  ```
+
+Upgrade pip and install dependencies:
+
+```bash
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+---
+
+## 3. Run the API
+
+You can run **only Postgres in Docker** and the **API on your machine**, or run **everything in Docker**.
+
+### Option A — API on your machine, Postgres in Docker
+
+1. Start the database (from the project root):
+
+   ```bash
+   docker compose up -d database
+   ```
+
+2. Wait until Postgres is healthy, then start the app:
+
+   ```bash
+   uvicorn app.main:app --reload
+   ```
+
+3. Open the interactive docs: **http://127.0.0.1:8000/docs** (default Uvicorn port is `8000` unless you change it).
+
+If the app cannot connect to the database, confirm `DATABASE_URL` in `.env` matches the published Postgres port and credentials.
+
+### Option B — Full stack in Docker
+
+Assumes Docker is installed and running.
+
+```bash
+docker compose up -d --build
+```
+
+- The **API** is published on the host port set by **`API_PUBLISH_PORT`** in `.env` (default in the template is `8016`).
+- Open Swagger at `http://127.0.0.1:<port>/docs`, where `<port>` is **`API_PUBLISH_PORT`** from `.env` (the template uses `8016`).
+
+To stop containers:
+
+```bash
+docker compose down
+```
+
+---

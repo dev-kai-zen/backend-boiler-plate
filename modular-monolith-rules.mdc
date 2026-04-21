@@ -1,0 +1,341 @@
+---
+description: Modular Monolith Architecture Rules
+alwaysApply: true
+---
+
+# Modular Monolith Architecture Rules
+
+This project follows a Modular Monolith architecture designed to be easily splittable into microservices in the future.
+
+The system is structured into layers with strict separation of concerns.
+
+**Dependency flow (service is the hub):**
+
+- `router` → `service` only
+- `service` → `repository` (this module’s DB)
+- `service` → `clients` (any outbound communication)
+- `service` → `helpers` (pure utilities)
+
+`repository`, `clients`, and `helpers` are **siblings** called **from** `service`, not a linear chain `repository → clients`.
+
+**Where logic lives (simple rule):**
+
+- **Service** = all **logic and decisions** (what to do, when to error, how to combine steps).
+- **Repository** = **database actions only** (read/write rows). No app logic, no workflows, no HTTP.
+
+---
+
+# 🧠 CORE PRINCIPLE
+
+Each layer has ONE responsibility.
+No layer should violate its boundary.
+
+---
+
+# 📛 NAMING ACROSS LAYERS (ROUTER / SERVICE / REPOSITORY)
+
+**Straight resource-shaped CRUD (thin, one clear persistence operation per call):**
+
+- Using the **same function name** across **router → service → repository** (e.g. `list_*`, `get_*_by_id`, `create_*`, `update_*`, `delete_*`) is a **good default**: easy to trace, grep, and review. Layers are already distinguished by **file/module** (`router.py`, `service.py`, `repository.py`), not by inventing different verbs per layer.
+
+**Orchestrated workflows (service coordinates multiple steps or multiple repositories/clients):**
+
+- Give the **router** and **service** a **task-based or use-case name** that describes the business action (e.g. `complete_signup`, `transfer_funds`, `publish_article`).
+- **Repositories** stay **data-oriented**: `get_by_id`, `list`, `insert`, `update`, `delete`, or narrow queries — whatever matches what the persistence layer actually does. The service composes several repository calls under one orchestration name.
+
+**Repository internals:**
+
+- Private helpers (`_apply_filters`, `select_active_rows`, etc.) do **not** need to mirror route or service names.
+
+---
+
+# 🟠 1. ROUTER LAYER (HTTP / API ENTRYPOINT)
+
+RULES:
+
+- Router must ONLY handle HTTP concerns
+- Must use Pydantic for request validation
+- Must NOT contain business logic
+- Must NOT perform **database work** in route handlers (no SQL, no ORM load/save, no `repository` calls)
+- Must NOT call repository directly
+- Must ONLY call service layer
+- Declare **fixed path segments before parameterized routes** — e.g. register `GET /resources/get-by-ids` **before** `GET /resources/{resource_id}` — so static paths are not swallowed by `{resource_id}`.
+
+ALLOWED:
+
+- request validation
+- response formatting
+- status codes
+
+FORBIDDEN:
+
+- business rules
+- DB queries or ORM usage in the router
+- calling clients or helpers directly (except simple validation helpers if needed)
+
+**SQLAlchemy session — rules to follow (FastAPI):**
+
+| Rule         | Requirement                                                                                                                                                                                                                                                                            |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **MUST**     | Obtain a request-scoped DB session with **`Depends(get_db)`** (or the project’s equivalent) on **standard** HTTP routes that need persistence, and pass **`db` only into `service` methods**—never into repositories or helpers from the router.                                       |
+| **MUST NOT** | Import or call **`repository`** from route modules, or run **any** query / ORM operation in a route handler.                                                                                                                                                                           |
+| **MUST NOT** | Use `Session` in the router for anything except **injecting** it into a **single** service call per handler (no session logic, commits, or rollbacks in the router).                                                                                                                   |
+| **SHOULD**   | Use the same **`db: Session = Depends(get_db)`** pattern across CRUD-style endpoints so tests and middleware stay consistent.                                                                                                                                                          |
+| **MAY**      | Create / close **`SessionLocal()` inside `service`** only for **documented exceptions** (e.g. OAuth callback that mixes external HTTP and DB, or routes that must not name `Session` in the router). Prefer **one default** project-wide; do not mix both styles on the same endpoint. |
+
+---
+
+# 🟢 2. SERVICE LAYER (BUSINESS LOGIC)
+
+RULES:
+
+- Service is the ORCHESTRATION layer and holds **all business logic** (rules, branching, “not found”, conflicts).
+- Can call:
+  - repository
+  - clients
+  - helpers
+- Must NOT contain SQL/ORM code directly
+- Must not use **outbound HTTP clients** directly (e.g. `httpx`, `requests`, calling remote URLs) — use the **client** layer for those. **Outbound HTTP** means **network I/O**; it is **not** the same as `import`ing another Python module in the same app (that is in-process, not “outbound HTTP”). Raising **`HTTPException`** (or similar) for **this request’s** response (**404**, **409**, etc.) **is** allowed here.
+
+FILE & IMPORT:
+
+- Implement the layer in **`service.py`** (singular) per module
+- Routers and other callers use: `from app.modules.<module> import service` then `service.create_foo(...)`
+- **Calling another top-level module** (`app/modules/<other>/`, different bounded context): this module’s **`service`** should use **`clients`** (`_billing_client`, etc.), **not** `import` another module’s **`service`** or **`repository`** directly. The **`client`** implementation may import `from app.modules.billing import service as billing_service` inside `billing_client.py` — that stays behind the client boundary.
+- **Nested packages under the same top-level module** (e.g. `rbac/user_roles` and `rbac/role_permissions`) are **one module** for isolation purposes: **services may call each other’s repositories** or compose reads without a **client** — same as **within-module joins** in the rules below. Use **clients** only when crossing **`app/modules/<name>/`** boundaries.
+
+CLIENT INSTANCES (inside `service.py`):
+
+- Hold default client instances as **private** module-level variables with a **`_` + `{integration}_client`** suffix
+- Examples: `_oauth_client`, `_billing_client` (one per outbound boundary this service uses)
+- Class names stay specific: e.g. `OAuthClient`, `BillingClient` in their respective client modules
+
+RESPONSIBILITIES:
+
+- authentication logic
+- authorization logic
+- workflows (login, register, create order, etc.)
+- decision making
+
+IMPORTANT:
+Service is the ONLY layer allowed to coordinate multiple dependencies.
+
+---
+
+# 🟡 3. REPOSITORY LAYER (DATA ACCESS)
+
+RULES:
+
+- The repository **only talks to the database** (SQLAlchemy / ORM): run queries, insert, update, delete.
+- **No application logic** — no “if not found then …” workflows, no rules about what the API should return. Put that in the **service**.
+- **Transactions:** Prefer **one transaction per repository method** (usually one `commit` boundary) so each method stays an atomic DB unit. If a method needs **more than one commit**, treat that as **unusual** — **document why**, or prefer **several repository calls** orchestrated from the **service** instead of multiple commits hidden inside one function.
+- **One DB-focused step per function** when you can: e.g. `get_by_id`, `list`, `create`, `update` on a row you already loaded, or `delete(db, entity)`.
+- An **`update_by_id`** that loads a row, applies fields, and commits in **one** function is acceptable as a **single persistence operation** (still typically **one transaction**), if your team uses that pattern consistently.
+- **Do not** hide **unrelated** multi-step persistence in one repository function (e.g. load one entity then delete rows in another table). **Do not** do **load-by-id and delete** in one repository function for the same delete flow — the **service** should **get → 404 → `delete(db, entity)`**.
+- Do **not** import FastAPI or raise **`HTTPException`**. Use plain results (`None`, empty list, row count); the **service** turns those into **404**, **409**, etc.
+
+RESPONSIBILITIES:
+
+- CRUD and queries only
+
+FORBIDDEN:
+
+- Business rules, auth logic, calling other modules or HTTP
+- **HTTP / API errors in the repository** — always map in the **service**
+
+**Database errors (e.g. unique constraint):**
+
+- SQLAlchemy often raises **`IntegrityError`** on commit. Catch it in the **service**, **`rollback()`** if needed, return **409** with a clear message — not a generic 500.
+
+**Deletes (two valid styles):**
+
+- **Default:** service **`get_by_id`** → if missing, **404** → repository **`delete(db, persisted_row)`** (only delete + commit).
+- **Optional:** one **`DELETE … WHERE id = …`**, return **rows deleted**; service treats **0** as **404**. Still no HTTP in the repository.
+
+---
+
+# 🔵 4. CLIENT LAYER (OUTBOUND COMMUNICATION)
+
+“**Outbound**” here means **outside the current module’s service boundary**: third-party APIs **and** other modules in the monolith. Anything that is not “this module’s repository + helpers” should go through a **client** so the service never reaches across modules or the network directly.
+
+RULES:
+
+- A client’s job is **only** communication: build requests, perform calls, map responses/errors
+- Must encapsulate **all** outbound HTTP and **all** calls into other modules (today: in-process; future: HTTP/RPC)
+- Must hide implementation details (**local import of another module’s service** vs **remote HTTP**)
+- Must be replaceable **without** changing the service’s orchestration (only the client implementation changes)
+
+MULTIPLE CLIENTS PER MODULE:
+
+- Expect **several** clients when a module talks to more than one boundary
+- Use **suffix** naming: **`{integration}_client.py`** (e.g. “OAuth client”, “billing client”)
+- Examples:
+  - `oauth_client.py` — OAuth / identity provider calls (`httpx`, etc.); class e.g. `OAuthClient`
+  - `billing_client.py` — billing module (today: call `billing.service`; tomorrow: HTTP to Billing service); class e.g. `BillingClient`
+- In **`service.py`**, default instances: `_oauth_client`, `_billing_client` (private, leading underscore)
+- Optional: group under a `clients/` package if the module grows (`clients/oauth_client.py`, …)
+
+RESPONSIBILITIES:
+
+- Third-party / vendor APIs
+- Other modules in the monolith (delegate to their **service** layer, never their repository)
+- Future microservices (same client interface, HTTP implementation)
+- Retries, timeouts, and raw API response handling (no business rules)
+
+FORBIDDEN:
+
+- business logic
+- database logic
+- decision making (“should we create vs update?” belongs in **service**)
+
+IMPORTANT:
+
+- The **service** must not care whether `billing_client` is a thin wrapper over `billing.service` or a remote HTTP client
+- Do **not** skip the client and import another module’s **repository** from this module’s service
+
+---
+
+# 📦 CROSS-MODULE SCHEMAS & DTOS
+
+This is the **same boundary** as “don’t import another module’s repository,” but for **types**: validation models, request/response DTOs, ORM entity classes, or any **exported type** that belongs to another feature’s package.
+
+**Don’t** import those types from **this** module’s **service**, **HTTP entrypoint**, or **repository**.
+
+**Do** keep them **inside the client** that talks to the other module. The client may use the other feature’s types **internally**; what it returns “upward” to your service should be **simple values** and/or **types declared in your own module**—so if the other feature becomes a remote service later, you mainly change **clients**, not every service file.
+
+**Shared types** are OK only from an **explicit** shared-contracts / kernel package the team maintains for stable cross-cutting shapes—not as a blanket import from random feature folders.
+
+**Why it matters:** Coupling services to another feature’s DTOs spreads refactors when you split deployables; coupling only **clients** keeps that churn contained.
+
+---
+
+# 🟣 5. HELPERS LAYER (PURE FUNCTIONS)
+
+RULES:
+
+- Helpers must be PURE functions
+- No DB access
+- No HTTP calls
+- No side effects
+
+RESPONSIBILITIES:
+
+- validation rules (e.g. email domain checks)
+- string utilities
+- formatting logic
+- reusable stateless functions
+
+EXAMPLE:
+
+- is_company_email(email)
+- hash_password(password)
+- format_date(date)
+
+FORBIDDEN:
+
+- business workflows
+- service orchestration
+- external communication
+
+---
+
+# 🧠 DEPENDENCY RULE
+
+Allowed dependency flow ONLY:
+
+- `router` → `service`
+- `service` → `repository` | `clients` | `helpers`
+
+NEVER reverse dependencies (e.g. repository → service, client → router).
+
+---
+
+# 🚨 ANTI-PATTERNS (STRICTLY FORBIDDEN)
+
+- Router containing business logic
+- **Business logic or hidden workflows in clients or repositories** (repository = DB actions only; clients communicate, they don’t decide product rules)
+- Repository calling service or clients
+- Helpers calling DB or the service layer
+- Service bypassing clients and calling outbound HTTP directly
+- Service importing another **top-level** module’s **repository** (use that module’s **client** → **service** instead). Does **not** apply to nested sub-packages under the **same** `app/modules/<name>/` (see **MODULE DATA ISOLATION RULE**).
+- Service, HTTP entrypoint, or repository importing another module’s **schemas / DTOs / persistence types** without going through a **client** (see **CROSS-MODULE SCHEMAS & DTOS**)
+- Fat router files
+
+---
+
+# 🔒 MODULE DATA ISOLATION RULE
+
+Each module owns its own database tables.
+
+**What counts as a “module” (for this document)**
+
+- A **module** is a **top-level** package under `app/modules/<name>/` (e.g. `users`, `rbac`).
+- Nested packages (e.g. `rbac/group`, `rbac/role_permissions`) are **sub-features of that same module**, not separate modules for isolation — unless you intentionally split them into another top-level `app/modules/<other>/` with its own tables and boundaries.
+
+**Within one module**
+
+- **Joins are allowed** between tables **owned by that same module** — that is normal (one bounded context, one repository layer).
+- **Sub-feature services** (nested packages under the same `app/modules/<name>/`) may **call another sub-feature’s `repository`** when composing in-process logic — **no client**; that is **intra-module**, not “another module.” Routers still **only** call **service**, never another package’s **repository**.
+
+**Across modules (default)**
+
+- **Do not** join or query another module’s tables from this module’s repository. That couples schemas and blocks a clean split later.
+- **Instead:** use the **client** layer → other module’s **service** (or compose results in **this** module’s **service** after separate reads).
+
+**Exceptions (explicit, rare)**
+
+- **Reports, analytics, exports, or other read-heavy** workloads may **cross module boundaries with SQL joins** only when **deliberately chosen** (product/tech decision), because a modular boundary would be too slow or too awkward.
+- Treat these as **exceptions**: document them, keep them in **dedicated** reporting/query code paths where possible, and know they **tighten coupling** and complicate future microservice extraction (you may later move them to a warehouse, materialized views, or a dedicated reporting service).
+
+RATIONALE (default path):
+
+- loose coupling
+- microservice readiness
+- independent module scalability
+
+EXAMPLE (FORBIDDEN — default CRUD):
+
+Module A’s repository joining tables owned by module B
+
+EXAMPLE (CORRECT):
+
+`orders.service` → `inventory_client` (e.g. `inventory_client.py`) → Inventory module’s `service` → fetch stock
+
+EXAMPLE (CORRECT, CROSS-MODULE CALLS — not joins):
+
+`auth.service` → `_oauth_client` / `oauth_client.py` → identity provider APIs; `auth.service` → `_billing_client` / `billing_client.py` → `billing.service` → sync account
+
+# 🧩 DESIGN GOAL
+
+This architecture must support:
+
+- modular monolith development
+- easy migration to microservices
+- isolated testing per layer
+- team parallel development
+
+---
+
+# 🔄 MICROSERVICE MIGRATION RULE
+
+When converting to microservices:
+
+- ONLY client layer changes (local call → HTTP)
+- service, repository, helpers remain unchanged
+- router remains mostly unchanged
+
+---
+
+# 🧪 TESTING GUIDELINE
+
+- Service layer must be testable with mocked:
+  - repository
+  - clients
+  - helpers
+- No real HTTP or DB calls in unit tests
+
+---
+
+# 🧠 FINAL PRINCIPLE
+
+"Service is the brain. Router is the door. Repository is storage. Client is communication. Helpers are tools."
